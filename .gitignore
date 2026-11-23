@@ -1,0 +1,7 @@
+/target
+
+# local recordings used for tuning
+wow_rec*.wav
+recording.wav
+bg_test.wav
+.DS_Store
