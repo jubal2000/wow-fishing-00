@@ -1,60 +1,53 @@
-//! Synthetic key presses via CoreGraphics events.
-//! Requires the Accessibility permission for the terminal running this tool.
+//! Key presses: parsing action lists and timing are shared; the actual
+//! keyboard events come from the platform module (macOS / Windows).
 
-use anyhow::{anyhow, bail, Result};
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGKeyCode};
-use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use anyhow::{bail, Result};
 use std::time::Duration;
 
-#[link(name = "ApplicationServices", kind = "framework")]
-unsafe extern "C" {
-    fn AXIsProcessTrusted() -> bool;
-}
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGPreflightPostEventAccess() -> bool;
-    fn CGRequestPostEventAccess() -> bool;
-    fn CGPreflightScreenCaptureAccess() -> bool;
-    fn CGRequestScreenCaptureAccess() -> bool;
-}
+#[cfg(target_os = "macos")]
+mod mac;
+#[cfg(target_os = "macos")]
+pub use mac::{accessibility_ok, frontmost_pid, request_permissions};
+#[cfg(target_os = "macos")]
+use mac as platform;
 
-/// True if this process may post synthetic key events.
-pub fn accessibility_ok() -> bool {
-    unsafe { CGPreflightPostEventAccess() || AXIsProcessTrusted() }
-}
+#[cfg(windows)]
+mod win;
+#[cfg(windows)]
+pub use win::{accessibility_ok, frontmost_pid, request_permissions};
+#[cfg(windows)]
+use win as platform;
 
-/// Ask macOS to show its permission prompts. This also adds the calling
-/// app (your terminal) to the right list in System Settings.
-pub fn request_permissions() -> (bool, bool) {
-    unsafe {
-        let keys = CGPreflightPostEventAccess() || CGRequestPostEventAccess();
-        let screen = CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess();
-        (keys, screen)
-    }
-}
+pub use platform::KeyCode;
 
-/// macOS virtual key codes (ANSI layout).
-pub fn keycode(name: &str) -> Result<CGKeyCode> {
+/// Normalize key names: aliases like "comma" become ",", case-insensitive.
+fn canonical(name: &str) -> String {
     let n = name.to_lowercase();
-    let code = match n.as_str() {
-        "a" => 0x00, "s" => 0x01, "d" => 0x02, "f" => 0x03, "h" => 0x04, "g" => 0x05,
-        "z" => 0x06, "x" => 0x07, "c" => 0x08, "v" => 0x09, "b" => 0x0B, "q" => 0x0C,
-        "w" => 0x0D, "e" => 0x0E, "r" => 0x0F, "y" => 0x10, "t" => 0x11, "1" => 0x12,
-        "2" => 0x13, "3" => 0x14, "4" => 0x15, "6" => 0x16, "5" => 0x17, "=" => 0x18,
-        "9" => 0x19, "7" => 0x1A, "-" => 0x1B, "8" => 0x1C, "0" => 0x1D, "]" => 0x1E,
-        "o" => 0x1F, "u" => 0x20, "[" => 0x21, "i" => 0x22, "p" => 0x23, "l" => 0x25,
-        "j" => 0x26, "'" => 0x27, "k" => 0x28, ";" => 0x29, "\\" => 0x2A, "," => 0x2B,
-        "/" => 0x2C, "n" => 0x2D, "m" => 0x2E, "." => 0x2F, "`" => 0x32,
-        "comma" => 0x2B, "period" | "dot" => 0x2F, "slash" => 0x2C, "semicolon" => 0x29,
-        "quote" => 0x27, "backslash" => 0x2A, "minus" => 0x1B, "equal" => 0x18,
-        "grave" | "backtick" => 0x32, "lbracket" => 0x21, "rbracket" => 0x1E,
-        "return" | "enter" => 0x24, "tab" => 0x30, "space" => 0x31, "esc" | "escape" => 0x35,
-        "f1" => 0x7A, "f2" => 0x78, "f3" => 0x63, "f4" => 0x76, "f5" => 0x60, "f6" => 0x61,
-        "f7" => 0x62, "f8" => 0x64, "f9" => 0x65, "f10" => 0x6D, "f11" => 0x67, "f12" => 0x6F,
-        "left" => 0x7B, "right" => 0x7C, "down" => 0x7D, "up" => 0x7E,
-        _ => bail!("unknown key '{name}'"),
-    };
-    Ok(code)
+    match n.as_str() {
+        "comma" => ",",
+        "period" | "dot" => ".",
+        "slash" => "/",
+        "semicolon" => ";",
+        "quote" => "'",
+        "backslash" => "\\",
+        "minus" => "-",
+        "equal" => "=",
+        "grave" | "backtick" => "`",
+        "lbracket" => "[",
+        "rbracket" => "]",
+        "enter" => "return",
+        "escape" => "esc",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Platform key code for a key name (a-z, 0-9, f1-f12, punctuation, space...).
+pub fn keycode(name: &str) -> Result<KeyCode> {
+    match platform::keycode(&canonical(name)) {
+        Some(c) => Ok(c),
+        None => bail!("unknown key '{name}'"),
+    }
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,46 +79,18 @@ pub struct KeyTarget {
     pub background: bool,
 }
 
-/// PID of the frontmost application (via `lsappinfo`).
-pub fn frontmost_pid() -> Option<i32> {
-    let run = |args: &[&str]| {
-        std::process::Command::new("lsappinfo")
-            .args(args)
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    };
-    let asn = run(&["front"])?;
-    let info = run(&["info", "-only", "pid", &asn])?;
-    // Output looks like `"pid"=12360` or `pid = 12360`.
-    let after = &info[info.find("pid")? + 3..];
-    let digits: String = after.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
-}
-
-fn post(ev: &CGEvent, target: KeyTarget) {
-    match (target.background, target.pid) {
-        (true, Some(pid)) => ev.post_to_pid(pid),
-        _ => ev.post(CGEventTapLocation::HID),
-    }
-}
-
-pub fn press(code: CGKeyCode, target: KeyTarget) -> Result<()> {
-    let src = || CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| anyhow!("CGEventSource failed"));
-    let down = CGEvent::new_keyboard_event(src()?, code, true).map_err(|_| anyhow!("key event failed"))?;
-    post(&down, target);
+pub fn press(code: KeyCode, target: KeyTarget) -> Result<()> {
+    platform::key_event(code, true, target)?;
     let (lo, hi) = (HOLD_MIN.load(Ordering::Relaxed), HOLD_MAX.load(Ordering::Relaxed));
     std::thread::sleep(Duration::from_millis(if hi > lo { rand::random_range(lo..=hi) } else { lo }));
-    let up = CGEvent::new_keyboard_event(src()?, code, false).map_err(|_| anyhow!("key event failed"))?;
-    post(&up, target);
-    Ok(())
+    platform::key_event(code, false, target)
 }
 
 /// One step: wait a random delay in [min,max] ms, then press `key`.
 #[derive(Clone, Debug)]
 pub struct Action {
     pub key: String,
-    pub code: CGKeyCode,
+    pub code: KeyCode,
     pub min_ms: u64,
     pub max_ms: u64,
 }

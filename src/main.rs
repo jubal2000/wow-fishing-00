@@ -1,6 +1,8 @@
 mod capture;
 mod features;
 mod keys;
+#[cfg(windows)]
+mod win_util;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
